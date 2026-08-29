@@ -18,6 +18,7 @@ package util
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/Project-HAMi/HAMi/pkg/util/client"
@@ -328,54 +330,135 @@ func TestGetAllocatePodByNode(t *testing.T) {
 func TestPatchPodAnnotations(t *testing.T) {
 	client.KubeClient = fake.NewClientset()
 
-	// Create test pod
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: "default",
-		},
-	}
-
-	client.KubeClient.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
+	longNodeName := "node-" + strings.Repeat("a", 60) // 65 chars > 63
 
 	tests := []struct {
-		name        string
-		pod         *corev1.Pod
-		annotations map[string]string
-		wantErr     bool
+		name          string
+		podName       string
+		annotations   map[string]string
+		wantErr       bool
+		wantLabel     bool
+		expectedLabel string
+		expectedNode  string
 	}{
 		{
-			name: "patch with valid annotations",
-			pod:  pod,
+			name:    "normal short node name",
+			podName: "pod-short",
 			annotations: map[string]string{
 				"test-key":              "test-value",
 				AssignedNodeAnnotations: "node1",
 			},
-			wantErr: false,
+			wantErr:       false,
+			wantLabel:     true,
+			expectedLabel: "node1",
+			expectedNode:  "node1",
 		},
 		{
-			name: "patch non-existent pod",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "non-existent",
-					Namespace: "default",
-				},
+			name:    "node name > 63 chars",
+			podName: "pod-long",
+			annotations: map[string]string{
+				AssignedNodeAnnotations: longNodeName,
 			},
+			wantErr:       false,
+			wantLabel:     true,
+			expectedLabel: SafeLabelValue(longNodeName),
+			expectedNode:  longNodeName,
+		},
+		{
+			name:    "patch non-existent pod",
+			podName: "non-existent",
 			annotations: map[string]string{
 				"test-key": "test-value",
 			},
-			wantErr: true,
+			wantErr:   true,
+			wantLabel: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := PatchPodAnnotations(tt.pod, tt.annotations)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tt.podName,
+					Namespace: "default",
+				},
+			}
+			if !tt.wantErr {
+				client.KubeClient.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
+			}
+
+			err := PatchPodAnnotations(pod, tt.annotations)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PatchPodAnnotations() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				updatedPod, err := client.KubeClient.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("failed to get pod after patch: %v", err)
+				}
+				if tt.expectedNode != "" {
+					assert.Equal(t, updatedPod.Annotations[AssignedNodeAnnotations], tt.expectedNode)
+				}
+				if tt.wantLabel {
+					assert.Equal(t, updatedPod.Labels[AssignedNodeAnnotations], tt.expectedLabel)
+				} else {
+					if updatedPod.Labels != nil {
+						_, exists := updatedPod.Labels[AssignedNodeAnnotations]
+						assert.Equal(t, exists, false)
+					}
+				}
 			}
 		})
 	}
+}
+
+func TestSafeLabelValue(t *testing.T) {
+	t.Run("short valid input returned unchanged", func(t *testing.T) {
+		input := "short-node-1"
+		got := SafeLabelValue(input)
+		assert.Equal(t, got, input)
+		errs := validation.IsValidLabelValue(got)
+		assert.Equal(t, len(errs), 0)
+	})
+
+	t.Run("input > 63 chars produces valid, deterministic output <= 63 chars", func(t *testing.T) {
+		input := "node-" + strings.Repeat("a", 60)
+		got1 := SafeLabelValue(input)
+		got2 := SafeLabelValue(input)
+
+		assert.Equal(t, got1, got2)
+		if len(got1) > validation.LabelValueMaxLength {
+			t.Errorf("SafeLabelValue length %d exceeds max length %d", len(got1), validation.LabelValueMaxLength)
+		}
+		errs := validation.IsValidLabelValue(got1)
+		assert.Equal(t, len(errs), 0)
+	})
+
+	t.Run("input with invalid characters produces valid label value", func(t *testing.T) {
+		// Note: This tests the helper's general-purpose string-to-label robustness.
+		// Real Kubernetes node names are valid DNS subdomains and will not contain such characters.
+		arbitraryInvalidCharsInput := "arbitrary@invalid#chars!"
+		got := SafeLabelValue(arbitraryInvalidCharsInput)
+
+		errs := validation.IsValidLabelValue(got)
+		assert.Equal(t, len(errs), 0)
+	})
+
+	t.Run("two different long inputs with same prefix produce different outputs", func(t *testing.T) {
+		prefix := "node-" + strings.Repeat("a", 60)
+		input1 := prefix + "-cluster1"
+		input2 := prefix + "-cluster2"
+
+		got1 := SafeLabelValue(input1)
+		got2 := SafeLabelValue(input2)
+
+		if got1 == got2 {
+			t.Errorf("Expected different outputs for different inputs with same prefix, got %q", got1)
+		}
+		assert.Equal(t, len(validation.IsValidLabelValue(got1)), 0)
+		assert.Equal(t, len(validation.IsValidLabelValue(got2)), 0)
+	})
 }
 
 func Test_IsPodInTerminatedState(t *testing.T) {
